@@ -2,7 +2,7 @@ use std::cmp::min;
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, bail, Error, Result};
 use console::{strip_ansi_codes, style, truncate_str, Style, Term};
 use regex::Regex;
 
@@ -10,6 +10,8 @@ use crate::output::Output;
 use crate::vmtest::Vmtest;
 
 const WINDOW_LENGTH: usize = 10;
+// sysexits.h catchall exit code for when we failed to run the vm for miscellaneous reasons.
+const EX_UNAVAILABLE: i32 = 69;
 
 /// Console UI
 ///
@@ -158,12 +160,14 @@ impl Ui {
 
     /// UI for a single target. Must be run on its own thread.
     ///
-    /// Returns if the target was successful or not>
-    fn target_ui(updates: Receiver<Output>, target: String, show_cmd: bool) -> bool {
+    /// Returns an Error if the vm failed to run the command.
+    /// Otherwise, return the return code of the command.
+    fn target_ui(updates: Receiver<Output>, target: String, show_cmd: bool) -> Result<i32> {
         let term = Term::stdout();
         let mut stage = Stage::new(term.clone(), &heading(&target, 1), None);
         let mut stages = 0;
         let mut errors = 0;
+        let mut rc: i32 = 0;
 
         // Main state machine loop
         loop {
@@ -208,12 +212,15 @@ impl Ui {
 
                     match r {
                         Ok(retval) => {
+                            rc = *retval as i32;
+                            // Do not increment the error counter here. The VM ran successfully, the error is convyed by
+                            // the command return code.
+                            // Nevertheless, we still want to make it clear to the user by logging to the console.
                             if *retval != 0 {
                                 error_out_stage(
                                     &mut stage,
                                     &anyhow!("Command failed with exit code: {}", retval),
                                 );
-                                errors += 1;
                             }
                         }
                         Err(e) => {
@@ -236,7 +243,10 @@ impl Ui {
             term.write_line("FAILED").expect("Failed to write terminal");
         }
 
-        errors == 0
+        if errors != 0 {
+            bail!("Failed to run the target");
+        }
+        Ok(rc)
     }
 
     /// Run all the targets in the provided `vmtest`
@@ -245,17 +255,21 @@ impl Ui {
     /// `show_cmd` specifies if the command output should always be shown.
     ///
     /// Note this function is "infallible" b/c on error it will display
-    /// the appropriate error message to screen. Rather, it returns how
-    /// many targets failed.
-    pub fn run(self, filter: &Regex, show_cmd: bool) -> usize {
+    /// the appropriate error message to screen.
+    /// In one-liner mode, it return the return code of the command, or EX_UNAVAILABLE if there
+    /// is an issue that prevents running the command.
+    /// When multiple targets are ran, it returns how many targets failed.
+    pub fn run(self, filter: &Regex, show_cmd: bool) -> i32 {
         let mut failed = 0;
-        for (idx, target) in self
+        let targets = self
             .vmtest
             .targets()
             .iter()
             .filter(|t| filter.is_match(&t.name))
-            .enumerate()
-        {
+            .collect::<Vec<_>>();
+        let single_cmd = targets.len() == 1;
+
+        for (idx, target) in targets.iter().enumerate() {
             let (sender, receiver) = channel::<Output>();
 
             // Start UI on its own thread b/c `Vmtest::run_one()` will block
@@ -265,9 +279,19 @@ impl Ui {
             // Run a target
             self.vmtest.run_one(idx, sender);
 
-            let success = ui.join().unwrap();
-            if !success {
-                failed += 1;
+            let rc = ui
+                .join()
+                .expect("Failed to join UI thread")
+                // Transform an error into a pre-baked error code that represent a failure to run the VM.
+                .unwrap_or(EX_UNAVAILABLE);
+
+            if single_cmd {
+                return rc;
+            }
+
+            failed += match rc {
+                0 => 0,
+                _ => 1,
             }
         }
 

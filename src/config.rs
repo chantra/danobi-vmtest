@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env::consts::ARCH;
 use std::path::PathBuf;
 use std::vec::Vec;
 
@@ -17,7 +18,7 @@ pub struct Mount {
 }
 
 /// VM Config for a target
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct VMConfig {
     /// Number of CPUs in the VM.
     ///
@@ -76,7 +77,7 @@ impl Default for VMConfig {
 }
 
 /// Config for a single target
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Target {
     /// Name of the testing target.
     pub name: String,
@@ -99,12 +100,49 @@ pub struct Target {
     ///
     /// Arguments are only valid for kernel targets.
     pub kernel_args: Option<String>,
+    /// Path to rootfs to test against.
+    ///
+    /// * The path is relative to `vmtest.toml`.
+    /// * If not specified, the host's rootfs will be used.
+    /// Default: /
+    #[serde(default = "Target::default_rootfs")]
+    pub rootfs: PathBuf,
+    /// Arch to run
+    #[serde(default = "Target::default_arch")]
+    pub arch: String,
     /// Command to run inside virtual machine.
     pub command: String,
 
     /// VM Configuration.
     #[serde(default)]
     pub vm: VMConfig,
+}
+
+impl Target {
+    /// Default rootfs path to use if none are specified.
+    pub fn default_rootfs() -> PathBuf {
+        "/".into()
+    }
+    /// Default architecure to use if none are specified.
+    pub fn default_arch() -> String {
+        ARCH.to_string()
+    }
+}
+
+impl Default for Target {
+    fn default() -> Self {
+        Self {
+            name: "".into(),
+            image: None,
+            uefi: false,
+            kernel: None,
+            kernel_args: None,
+            rootfs: Self::default_rootfs(),
+            arch: Self::default_arch(),
+            command: "".into(),
+            vm: VMConfig::default(),
+        }
+    }
 }
 
 /// Config containing full test matrix

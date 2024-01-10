@@ -31,18 +31,14 @@ fn test_run() {
                 image: Some(asset("image-uefi.raw-efi")),
                 uefi: true,
                 command: "/mnt/vmtest/main.sh nixos".to_string(),
-                kernel: None,
-                kernel_args: None,
-                vm: VMConfig::default(),
+                ..Default::default()
             },
             Target {
                 name: "not uefi image boots without uefi flag".to_string(),
                 image: Some(asset("image-not-uefi.raw")),
                 uefi: false,
                 command: "/mnt/vmtest/main.sh nixos".to_string(),
-                kernel: None,
-                kernel_args: None,
-                vm: VMConfig::default(),
+                ..Default::default()
             },
         ],
     };
@@ -50,6 +46,76 @@ fn test_run() {
     let ui = Ui::new(vmtest);
     let failed = ui.run(&*FILTER_ALL, false);
     assert_eq!(failed, 0);
+}
+
+// Expect that when we run multiple targets, we get the correct number of failures.
+#[test]
+fn test_run_multiple_return_number_failures() {
+    let config = Config {
+        target: vec![
+            Target {
+                name: "uefi image boots with uefi flag".to_string(),
+                image: Some(asset("image-uefi.raw-efi")),
+                uefi: true,
+                command: "exit 1".to_string(),
+                ..Default::default()
+            },
+            Target {
+                name: "uefi image boots with uefi flag 2".to_string(),
+                image: Some(asset("image-uefi.raw-efi")),
+                uefi: true,
+                command: "exit 1".to_string(),
+                ..Default::default()
+            },
+            Target {
+                name: "not uefi image boots without uefi flag".to_string(),
+                image: Some(asset("image-not-uefi.raw")),
+                uefi: false,
+                command: "/mnt/vmtest/main.sh nixos".to_string(),
+                ..Default::default()
+            },
+        ],
+    };
+    let (vmtest, _dir) = setup(config, &["main.sh"]);
+    let ui = Ui::new(vmtest);
+    let failed = ui.run(&*FILTER_ALL, false);
+    assert_eq!(failed, 2);
+}
+
+// Expect that when we run a single target, we return the return code of the command.
+#[test]
+fn test_run_single_return_number_return_code() {
+    let config = Config {
+        target: vec![Target {
+            name: "not uefi image boots without uefi flag".to_string(),
+            image: Some(asset("image-not-uefi.raw")),
+            uefi: false,
+            command: "exit 12".to_string(),
+            ..Default::default()
+        }],
+    };
+    let (vmtest, _dir) = setup(config, &["main.sh"]);
+    let ui = Ui::new(vmtest);
+    let failed = ui.run(&*FILTER_ALL, false);
+    assert_eq!(failed, 12);
+}
+
+// Expect that when we fail to start the vm, we return 69 (EX_UNAVAILABLE).
+#[test]
+fn test_vmtest_infra_error() {
+    let config = Config {
+        target: vec![Target {
+            name: "not an actual image, should return EX_UNAVAILABLE".to_string(),
+            image: Some(asset("not_an_actual_image")),
+            uefi: false,
+            command: "exit 12".to_string(),
+            ..Default::default()
+        }],
+    };
+    let (vmtest, _dir) = setup(config, &["main.sh"]);
+    let ui = Ui::new(vmtest);
+    let failed = ui.run(&*FILTER_ALL, false);
+    assert_eq!(failed, 69);
 }
 
 // Expect we can run each target one by one, sucessfully
@@ -65,18 +131,14 @@ fn test_run_one() {
                 image: Some(uefi_image.as_pathbuf()),
                 uefi: true,
                 command: "/mnt/vmtest/main.sh nixos".to_string(),
-                kernel: None,
-                kernel_args: None,
-                vm: VMConfig::default(),
+                ..Default::default()
             },
             Target {
                 name: "not uefi image boots without uefi flag".to_string(),
                 image: Some(non_uefi_image.as_pathbuf()),
                 uefi: false,
                 command: "/mnt/vmtest/main.sh nixos".to_string(),
-                kernel: None,
-                kernel_args: None,
-                vm: VMConfig::default(),
+                ..Default::default()
             },
         ],
     };
@@ -101,18 +163,14 @@ fn test_run_out_of_bounds() {
                 image: Some(uefi_image.as_pathbuf()),
                 uefi: true,
                 command: "/mnt/vmtest/main.sh nixos".to_string(),
-                kernel: None,
-                kernel_args: None,
-                vm: VMConfig::default(),
+                ..Default::default()
             },
             Target {
                 name: "not uefi image boots without uefi flag".to_string(),
                 image: Some(non_uefi_image.as_pathbuf()),
                 uefi: false,
                 command: "/mnt/vmtest/main.sh nixos".to_string(),
-                kernel: None,
-                kernel_args: None,
-                vm: VMConfig::default(),
+                ..Default::default()
             },
         ],
     };
@@ -133,9 +191,7 @@ fn test_not_uefi() {
             image: Some(uefi_image.as_pathbuf()),
             uefi: false,
             command: "echo unreachable".to_string(),
-            kernel: None,
-            kernel_args: None,
-            vm: VMConfig::default(),
+            ..Default::default()
         }],
     };
     let (vmtest, _dir) = setup(config, &["main.sh"]);
@@ -150,13 +206,10 @@ fn test_command_runs_in_shell() {
         target: vec![Target {
             name: "command is run in shell".to_string(),
             kernel: Some(asset("bzImage-v5.15-empty")),
-            kernel_args: None,
             // `$0` is a portable way of getting the name of the shell without relying
             // on env vars which may be propagated from the host into the guest.
             command: "if true; then echo -n $0 > /mnt/vmtest/result; fi".to_string(),
-            image: None,
-            uefi: false,
-            vm: VMConfig::default(),
+            ..Default::default()
         }],
     };
     let (vmtest, dir) = setup(config, &[]);
@@ -178,11 +231,8 @@ fn test_kernel_target_env_var_propagation() {
         target: vec![Target {
             name: "host env vars are propagated into guest".to_string(),
             kernel: Some(asset("bzImage-v5.15-empty")),
-            kernel_args: None,
             command: "echo -n $TEST_ENV_VAR > /mnt/vmtest/result".to_string(),
-            image: None,
-            uefi: false,
-            vm: VMConfig::default(),
+            ..Default::default()
         }],
     };
 
@@ -207,11 +257,8 @@ fn test_kernel_target_cwd_preserved() {
         target: vec![Target {
             name: "host cwd preserved in guest".to_string(),
             kernel: Some(asset("bzImage-v5.15-empty")),
-            kernel_args: None,
             command: "cat text_file.txt".to_string(),
-            image: None,
-            uefi: false,
-            vm: VMConfig::default(),
+            ..Default::default()
         }],
     };
 
@@ -231,16 +278,36 @@ fn test_kernel_target_cwd_preserved() {
 }
 
 #[test]
+fn test_command_process_substitution() {
+    let config = Config {
+        target: vec![Target {
+            name: "command can run process substitution".to_string(),
+            kernel: Some(asset("bzImage-v5.15-empty")),
+            // `$0` is a portable way of getting the name of the shell without relying
+            // on env vars which may be propagated from the host into the guest.
+            command: "cat <(echo -n $0) > /mnt/vmtest/result".to_string(),
+            ..Default::default()
+        }],
+    };
+    let (vmtest, dir) = setup(config, &[]);
+    let (send, recv) = channel();
+    vmtest.run_one(0, send);
+    assert_no_err!(recv);
+
+    // Check that output file contains the shell
+    let result_path = dir.path().join("result");
+    let result = fs::read_to_string(result_path).expect("Failed to read result");
+    assert_eq!(result, "bash");
+}
+
+#[test]
 fn test_qemu_error_shown() {
     let config = Config {
         target: vec![Target {
             name: "invalid kernel path".to_string(),
             kernel: Some(asset("doesn't exist")),
-            kernel_args: None,
             command: "true".to_string(),
-            image: None,
-            uefi: false,
-            vm: VMConfig::default(),
+            ..Default::default()
         }],
     };
     let (vmtest, _dir) = setup(config, &[]);
@@ -265,9 +332,7 @@ fn test_kernel_ro_flag() {
             kernel: Some(asset("bzImage-v5.15-empty")),
             kernel_args: Some("ro".to_string()),
             command: format!("touch {}/file", touch_dir.path().display()),
-            image: None,
-            uefi: false,
-            vm: VMConfig::default(),
+            ..Default::default()
         }],
     };
     let (vmtest, _dir) = setup(config, &[]);
@@ -288,12 +353,11 @@ fn test_run_custom_resources() {
                 image: Some(uefi_image_t1.as_pathbuf()),
                 uefi: true,
                 command: r#"bash -xc "[[ "$(nproc)" == "1" ]]""#.into(),
-                kernel: None,
-                kernel_args: None,
                 vm: VMConfig {
                     num_cpus: 1,
                     ..Default::default()
                 },
+                ..Default::default()
             },
             Target {
                 name: "Custom amount of RAM".to_string(),
@@ -302,12 +366,11 @@ fn test_run_custom_resources() {
                 // Should be in the 200 thousands, but it's variable.
                 command: r#"bash -xc "cat /proc/meminfo | grep 'MemTotal:         2..... kB'""#
                     .into(),
-                kernel: None,
-                kernel_args: None,
                 vm: VMConfig {
                     memory: "256M".into(),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         ],
     };
@@ -330,8 +393,6 @@ fn test_run_custom_mounts() {
                 image: Some(uefi_image.as_pathbuf()),
                 uefi: true,
                 command: r#"bash -xc "[[ -e /tmp/mount/README.md ]]""#.into(),
-                kernel: None,
-                kernel_args: None,
                 vm: VMConfig {
                     mounts: HashMap::from([(
                         "/tmp/mount".into(),
@@ -342,14 +403,13 @@ fn test_run_custom_mounts() {
                     )]),
                     ..Default::default()
                 },
+                ..Default::default()
             },
             Target {
                 name: "RO mount".to_string(),
                 image: Some(uefi_image.as_pathbuf()),
                 uefi: true,
                 command: r#"bash -xc "(touch /tmp/ro/hi && exit -1) || true""#.into(),
-                kernel: None,
-                kernel_args: None,
                 vm: VMConfig {
                     mounts: HashMap::from([(
                         "/tmp/ro".into(),
@@ -360,6 +420,7 @@ fn test_run_custom_mounts() {
                     )]),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         ],
     };

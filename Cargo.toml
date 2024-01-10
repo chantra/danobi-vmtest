@@ -4,14 +4,14 @@ authors = ["Daniel Xu <dxu@dxuuu.xyz>"]
 description = "Helps run your tests in virtual machines"
 repository = "https://github.com/danobi/vmtest"
 readme = "README.md"
-version = "0.8.2"
+version = "0.10.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.70.0"
 
 [dependencies]
 anyhow = "1.0.66"
-clap = { version = "4.0.26", features = ["derive"] }
+clap = { version = "4.0.26", features = ["derive", "string"] }
 console = "0.15.5"
 env_logger = "0.10.0"
 itertools = "0.10.5"
@@ -24,7 +24,9 @@ scopeguard = "1.1.0"
 serde = "1.0.147"
 serde_derive = "1.0.147"
 tempfile = "3.5.0"
+tinytemplate = "1.2.1"
 toml = "0.5.9"
 
 [dev-dependencies]
 test-log = "0.2.11"
+rstest = "0.18.2"

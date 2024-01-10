@@ -75,6 +75,10 @@ mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup
 log "Mounting tmpfs at /mnt"
 mount -t tmpfs -o nosuid,nodev tmpfs /mnt
 
+# Symlink /dev/fd to /proc/self/fd so process substitution works.
+log "Symlink /dev/fd to /proc/self/fd"
+[[ -a /dev/fd ]] || ln -s /proc/self/fd /dev/fd
+
 log "Init done"
 
 # Locate our QGA virtio port
@@ -91,5 +95,11 @@ if [[ -z "$vport" ]]; then
 fi
 log "Located qemu-guest-agent virtio port: ${vport}"
 
+# Send QGA logs out via kmsg if possible
+qga_logs=
+if [[ -e /dev/kmsg ]]; then
+    qga_logs="--logfile /dev/kmsg"
+fi
+
 log "Spawning qemu-ga"
-qemu-ga --method=virtio-serial --path="$vport"
+qemu-ga --method=virtio-serial --path="$vport" $qga_logs

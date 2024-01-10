@@ -7,6 +7,7 @@ use std::fs;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::marker::Send;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -20,16 +21,20 @@ use anyhow::{anyhow, bail, Context, Result};
 use log::{debug, log_enabled, warn, Level};
 use qapi::{qga, qmp, Qmp};
 use rand::Rng;
+use serde_derive::Serialize;
 use tempfile::{Builder, NamedTempFile};
+use tinytemplate::{format_unescaped, TinyTemplate};
 
 use crate::output::Output;
 use crate::qga::QgaWrapper;
-use crate::{Mount, VMConfig};
+use crate::{Mount, Target, VMConfig};
 
 const INIT_SCRIPT: &str = include_str!("init/init.sh");
+const COMMAND_TEMPLATE: &str = include_str!("init/command.template");
 // Needs to be `/dev/root` for kernel to "find" the 9pfs as rootfs
 const ROOTFS_9P_FS_MOUNT_TAG: &str = "/dev/root";
 const SHARED_9P_FS_MOUNT_TAG: &str = "vmtest-shared";
+const COMMAND_OUTPUT_PORT_NAME: &str = "org.qemu.virtio_serial.0";
 
 const SHARED_9P_FS_MOUNT_PATH: &str = "/mnt/vmtest";
 const MOUNT_OPTS_9P_FS: &str = "trans=virtio,cache=loose,msize=1048576";
@@ -49,7 +54,12 @@ pub struct Qemu {
     qga_sock: PathBuf,
     qmp_sock: PathBuf,
     command: String,
+    /// virtio-serial socket that streams command output
+    command_sock: PathBuf,
     host_shared: PathBuf,
+    /// Path to somewhere on the host that the guest should use as rootfs
+    rootfs: PathBuf,
+    arch: String,
     mounts: HashMap<String, Mount>,
     _init: NamedTempFile,
     updates: Sender<Output>,
@@ -57,11 +67,24 @@ pub struct Qemu {
     image: bool,
 }
 
+/// Used by templating engine to render command
+#[derive(Serialize)]
+struct CommandContext {
+    /// True if command should change working directory before executing.
+    should_cd: bool,
+    /// Path to directory shared between guest/host
+    host_shared: PathBuf,
+    /// User supplied command to run
+    command: String,
+    /// virtio-serial output port name
+    command_output_port_name: String,
+}
+
 const QEMU_DEFAULT_ARGS: &[&str] = &["-nodefaults", "-display", "none"];
 
 /// Whether or not the host supports KVM
-fn host_supports_kvm() -> bool {
-    Path::new("/dev/kvm").exists()
+fn host_supports_kvm(arch: &str) -> bool {
+    arch == ARCH && Path::new("/dev/kvm").exists()
 }
 
 // Generate a path to a randomly named socket
@@ -76,29 +99,74 @@ fn gen_sock(prefix: &str) -> PathBuf {
     path
 }
 
-fn gen_init() -> Result<NamedTempFile> {
-    let mut f = Builder::new()
+// Given a guest temp dir and a host init path, generate the path to the init file
+// in the guest.
+// This path is the one that will be passed to the guest via the kernel's `init=` parameter.
+// Returns an error if the guest_temp_dir is not a suffix of host_init_path.parent().
+fn guest_init_path(guest_temp_dir: PathBuf, host_init_path: PathBuf) -> Result<PathBuf> {
+    // guest_temp_dir should be the suffix of host_init_path.parent()
+    if !host_init_path
+        .parent()
+        .context(format!(
+            "host_init_path {:?} should have a parent",
+            host_init_path
+        ))?
+        .ends_with(guest_temp_dir.strip_prefix("/").context(format!(
+            "guest_temp_dir {:?} should be an absolute path",
+            guest_temp_dir
+        ))?)
+    {
+        bail!(
+            "guest_temp_dir {:?} should be a suffix of host_init_path.parent() {:?}",
+            guest_temp_dir,
+            host_init_path.parent()
+        );
+    }
+    let mut guest_init_path = guest_temp_dir;
+    guest_init_path.push(host_init_path.file_name().unwrap());
+    Ok(guest_init_path)
+}
+
+// Given a rootfs, generate a tempfile with the init script inside.
+// Returns the tempfile and the path to the init script inside the guest.
+// When rootfs is /, both the tempfile filename and guest init path are equal.
+// When rootfs is different than /, the guest init path is the same as the
+// tempfile filename, but with the rootfs path stripped off.
+fn gen_init(rootfs: &Path) -> Result<(NamedTempFile, PathBuf)> {
+    let guest_temp_dir = std::env::temp_dir();
+    let mut host_dest_dir = rootfs.to_path_buf().into_os_string();
+    host_dest_dir.push(guest_temp_dir.clone().into_os_string());
+
+    let mut host_init = Builder::new()
         .prefix("vmtest-init")
         .suffix(".sh")
         .rand_bytes(5)
-        .tempfile()
+        .tempfile_in::<OsString>(host_dest_dir)
         .context("Failed to create tempfile")?;
 
-    f.write_all(INIT_SCRIPT.as_bytes())
+    host_init
+        .write_all(INIT_SCRIPT.as_bytes())
         .context("Failed to write init to tmpfs")?;
 
     // Set write bits on script
-    let mut perms = f
+    let mut perms = host_init
         .as_file()
         .metadata()
         .context("Failed to get init tempfile metadata")?
         .permissions();
     perms.set_mode(perms.mode() | 0o111);
-    f.as_file()
+    host_init
+        .as_file()
         .set_permissions(perms)
         .context("Failed to set executable bits on init tempfile")?;
 
-    Ok(f)
+    // Path in the guest is our guest_temp_dir to which we append the file
+    // name of the host init script.
+    let guest_init = guest_init_path(guest_temp_dir, host_init.path().to_path_buf())?;
+    debug!(
+        "rootfs path: {rootfs:?}, init host path: {host_init:?}, init guest path: {guest_init:?}"
+    );
+    Ok((host_init, guest_init))
 }
 
 /// Generate arguments for inserting a file as a drive into the guest
@@ -143,16 +211,35 @@ fn guest_agent_args(sock: &Path) -> Vec<OsString> {
 }
 
 /// Generate arguments for full KVM virtualization if host supports it
-fn kvm_args() -> Vec<&'static str> {
+fn kvm_args(arch: &str) -> Vec<&'static str> {
     let mut args = Vec::new();
 
-    if host_supports_kvm() {
+    if host_supports_kvm(arch) {
         args.push("-enable-kvm");
         args.push("-cpu");
         args.push("host");
     } else {
         args.push("-cpu");
-        args.push("qemu64");
+        match arch {
+            "aarch64" | "s390x" => {
+                args.push("max");
+            }
+            _ => {
+                args.push("qemu64");
+            }
+        }
+    }
+    args
+}
+
+/// Generate arguments for which qemu machine to use
+fn machine_args(arch: &str) -> Vec<&'static str> {
+    let mut args = Vec::new();
+
+    if arch == "aarch64" {
+        // aarch64 does not have default machines.
+        args.push("-machine");
+        args.push("virt,gic-version=3");
     }
 
     args
@@ -224,11 +311,23 @@ fn uefi_firmware_args(bios: Option<&Path>) -> Vec<OsString> {
     args
 }
 
+/// Generate which serial device to use based on the architecture used.
+fn console_device(arch: &str) -> String {
+    match arch {
+        "aarch64" => "ttyAMA0".into(),
+        _ => "0".into(),
+    }
+}
 /// Generate arguments for running a kernel with current userspace
 ///
 /// The basic idea is we'll map host root onto guest root. And then use
 /// the host's systemd as init but boot into `rescue.target` in the guest.
-fn kernel_args(kernel: &Path, init: &Path, additional_kargs: Option<&String>) -> Vec<OsString> {
+fn kernel_args(
+    kernel: &Path,
+    arch: &str,
+    init: &Path,
+    additional_kargs: Option<&String>,
+) -> Vec<OsString> {
     let mut args = Vec::new();
 
     // Set the guest kernel
@@ -252,10 +351,10 @@ fn kernel_args(kernel: &Path, init: &Path, additional_kargs: Option<&String>) ->
     cmdline.push("rw".into());
 
     // Show as much console output as we can bear
-    cmdline.push("earlyprintk=serial,0,115200".into());
+    cmdline.push(format!("earlyprintk=serial,{},115200", console_device(arch)).into());
     // Disable userspace writing ratelimits
     cmdline.push("printk.devkmsg=on".into());
-    cmdline.push("console=0,115200".into());
+    cmdline.push(format!("console={},115200", console_device(arch)).into());
     cmdline.push("loglevel=7".into());
 
     // We are not using RAID and this will help speed up boot
@@ -282,6 +381,30 @@ fn kernel_args(kernel: &Path, init: &Path, additional_kargs: Option<&String>) ->
     // Set host side qemu kernel command line
     args.push("-append".into());
     args.push(cmdline.join(OsStr::new(" ")));
+
+    args
+}
+
+/// Generate arguments for setting up virtio-serial device to stream
+/// command output from guest to host.
+fn virtio_serial_args(host_sock: &Path) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
+
+    args.push("--device".into());
+    args.push("virtio-serial".into());
+
+    args.push("-chardev".into());
+    let mut arg = OsString::new();
+    arg.push("socket,path=");
+    arg.push(host_sock);
+    arg.push(",server=on,wait=off,id=cmdout");
+    args.push(arg);
+
+    args.push("--device".into());
+    arg = OsString::new();
+    arg.push("virtserialport,chardev=cmdout,name=");
+    arg.push(COMMAND_OUTPUT_PORT_NAME);
+    args.push(arg);
 
     args
 }
@@ -324,6 +447,39 @@ fn vmconfig_args(vm: &VMConfig) -> Vec<OsString> {
     args
 }
 
+/// Stream command output to the output sink
+///
+/// Calling this function will spawn a thread that synchronously reads
+/// from the provided unix domain socket. This is to reduce latency between
+/// command output and text on screen (as opposed to non-blocking reads with
+/// sleeps).
+///
+/// We implicitly rely on the stream closing (via synchronous qemu exit) to
+/// terminate this thread.
+fn stream_command_output<F>(stream: UnixStream, output: F)
+where
+    F: Fn(String) + Send + 'static,
+{
+    let mut reader = BufReader::new(stream);
+
+    thread::spawn(move || {
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    // Remove newline
+                    if let Some('\n') = line.chars().last() {
+                        line.pop();
+                    }
+                    output(line);
+                }
+                Err(e) => debug!("Failed to read from command output stream: {}", e),
+            };
+        }
+    });
+}
+
 /// Run a process inside the VM and wait until completion
 ///
 /// NB: this is not a shell, so you won't get shell features unless you run a
@@ -333,16 +489,21 @@ fn vmconfig_args(vm: &VMConfig) -> Vec<OsString> {
 /// into the VM. This is useful for running user specified commands which may
 /// depend on the calling environment.
 ///
+/// `output_stream` is a unix domain socket that contains the streamed output
+/// of `cmd`. Provide this when output latency is important (for example with
+/// potentially long running `cmd`s).
+///
 /// Returns the exit code if command is run
 fn run_in_vm<F>(
     qga: &QgaWrapper,
-    output: F,
+    output: &F,
     cmd: &str,
     args: &[&str],
     propagate_env: bool,
+    output_stream: Option<UnixStream>,
 ) -> Result<i64>
 where
-    F: Fn(String),
+    F: Fn(String) + Clone + Send + 'static,
 {
     let version = qga.version();
     let qga_args = qga::guest_exec {
@@ -369,45 +530,21 @@ where
         .context("Failed to QGA guest-exec")?;
     let pid = handle.pid;
 
+    // If requested, start streaming output. We will still use guest-exec
+    // output facilities as backup (and for streaming error messages).
+    if let Some(stream) = output_stream {
+        stream_command_output(stream, (*output).clone());
+    }
+
     let now = time::Instant::now();
     let mut period = Duration::from_millis(200);
-    let mut stdout_pos = 0;
-    let mut stderr_pos = 0;
-    let rc = loop {
+    let status = loop {
         let status = qga
             .guest_exec_status(pid)
             .context("Failed to QGA guest-exec-status")?;
 
-        // Give the most recent output to receiver
-        if let Some(stdout) = status.out_data {
-            String::from_utf8_lossy(&stdout)
-                .lines()
-                .skip(stdout_pos)
-                .for_each(|line| {
-                    output(line.to_string());
-                    stdout_pos += 1;
-                })
-        }
-        if let Some(true) = status.out_truncated {
-            output("<stdout truncation>".to_string());
-        }
-        // Note we give stderr last as error messages are usually towards
-        // the end of command output (if not the final line)
-        if let Some(stderr) = status.err_data {
-            String::from_utf8_lossy(&stderr)
-                .lines()
-                .skip(stderr_pos)
-                .for_each(|line| {
-                    output(line.to_string());
-                    stderr_pos += 1;
-                })
-        }
-        if let Some(true) = status.err_truncated {
-            output("<stderr truncation>".to_string());
-        }
-
         if status.exited {
-            break status.exitcode.unwrap_or(0);
+            break status;
         }
 
         let elapsed = now.elapsed();
@@ -427,29 +564,43 @@ where
         }
     };
 
-    Ok(rc)
+    // Despite appearances, guest-exec-status only returns stdout and
+    // stderr output _after_ the process exits. So parse it now after the
+    // command is done.
+    if let Some(stdout) = status.out_data {
+        String::from_utf8_lossy(&stdout).lines().for_each(|line| {
+            output(line.to_string());
+        })
+    }
+    if let Some(true) = status.out_truncated {
+        output("<stdout truncation>".to_string());
+    }
+
+    // Note we give stderr last as error messages are usually towards
+    // the end of command output (if not the final line)
+    if let Some(stderr) = status.err_data {
+        String::from_utf8_lossy(&stderr).lines().for_each(|line| {
+            output(line.to_string());
+        })
+    }
+    if let Some(true) = status.err_truncated {
+        output("<stderr truncation>".to_string());
+    }
+
+    Ok(status.exitcode.unwrap_or(0))
 }
 
 impl Qemu {
     /// Construct a QEMU instance backing a vmtest target.
     ///
     /// Does not run anything yet.
-    pub fn new(
-        updates: Sender<Output>,
-        image: Option<&Path>,
-        kernel: Option<&Path>,
-        kargs: Option<&String>,
-        bios: Option<&Path>,
-        command: &str,
-        host_shared: &Path,
-        uefi: bool,
-        vm: &VMConfig,
-    ) -> Result<Self> {
+    pub fn new(updates: Sender<Output>, target: &Target, host_shared: &Path) -> Result<Self> {
         let qga_sock = gen_sock("qga");
         let qmp_sock = gen_sock("qmp");
-        let init = gen_init().context("Failed to generate init")?;
+        let command_sock = gen_sock("cmdout");
+        let (init, guest_init) = gen_init(&target.rootfs).context("Failed to generate init")?;
 
-        let mut c = Command::new(format!("qemu-system-{}", ARCH));
+        let mut c = Command::new(format!("qemu-system-{}", target.arch));
 
         c.args(QEMU_DEFAULT_ARGS)
             .stdin(Stdio::null())
@@ -457,23 +608,30 @@ impl Qemu {
             .stderr(Stdio::piped())
             .arg("-serial")
             .arg("stdio")
-            .args(kvm_args())
+            .args(kvm_args(&target.arch))
+            .args(machine_args(&target.arch))
             .args(machine_protocol_args(&qmp_sock))
-            .args(guest_agent_args(&qga_sock));
+            .args(guest_agent_args(&qga_sock))
+            .args(virtio_serial_args(&command_sock));
         // Always ensure the rootfs is first.
-        if let Some(image) = image {
-            c.args(drive_args(image, 1));
-            if uefi {
-                c.args(uefi_firmware_args(bios));
+        if let Some(image) = target.image.clone() {
+            c.args(drive_args(&image, 1));
+            if target.uefi {
+                c.args(uefi_firmware_args(target.vm.bios.as_deref()));
             }
-        } else if let Some(kernel) = kernel {
+        } else if let Some(kernel) = target.kernel.clone() {
             c.args(plan9_fs_args(
-                Path::new("/"),
+                target.rootfs.as_path(),
                 "root",
                 ROOTFS_9P_FS_MOUNT_TAG,
                 false,
             ));
-            c.args(kernel_args(kernel, init.path(), kargs));
+            c.args(kernel_args(
+                &kernel,
+                &target.arch,
+                guest_init.as_path(),
+                target.kernel_args.as_ref(),
+            ));
         } else {
             panic!("Config validation should've enforced XOR");
         }
@@ -484,7 +642,7 @@ impl Qemu {
             SHARED_9P_FS_MOUNT_TAG,
             false,
         ));
-        c.args(vmconfig_args(vm));
+        c.args(vmconfig_args(&target.vm));
 
         if log_enabled!(Level::Error) {
             let args = c.get_args().map(|a| a.to_string_lossy()).join(" ");
@@ -499,12 +657,15 @@ impl Qemu {
             process: c,
             qga_sock,
             qmp_sock,
-            command: command.to_string(),
+            command: target.command.to_string(),
+            command_sock,
             host_shared: host_shared.to_owned(),
-            mounts: vm.mounts.clone(),
+            rootfs: target.rootfs.clone(),
+            arch: target.arch.clone(),
+            mounts: target.vm.mounts.clone(),
             _init: init,
             updates,
-            image: image.is_some(),
+            image: target.image.is_some(),
         })
     }
 
@@ -536,13 +697,13 @@ impl Qemu {
         bail!("QEMU sockets did not appear in time");
     }
 
-    /// Connect to QMP socket
-    fn connect_to_qmp(&self) -> Result<UnixStream> {
+    /// Connect to unix domain socket
+    fn connect_to_uds(&self, path: &Path) -> Result<UnixStream> {
         let now = time::Instant::now();
         let timeout = Duration::from_secs(5);
 
         while now.elapsed() < timeout {
-            if let Ok(stream) = UnixStream::connect(&self.qmp_sock) {
+            if let Ok(stream) = UnixStream::connect(path) {
                 return Ok(stream);
             }
 
@@ -557,27 +718,38 @@ impl Qemu {
 
     /// Generates a bash script that runs `self.command`
     fn command_script(&self) -> String {
-        if self.image {
-            // Image targets do not share host FS at all, so a `cd` will never succeed
-            self.command.clone()
-        } else {
-            // Kernel targets share host FS so this `cd` should succeed. If it doesn't,
-            // the error is shown to the user as a hint.
-            format!(
-                "cd {}; {}",
-                self.host_shared.to_string_lossy(),
-                &self.command
-            )
-        }
+        // Disable HTML escaping (b/c we're not dealing with HTML)
+        let mut tt = TinyTemplate::new();
+        tt.set_default_formatter(&format_unescaped);
+
+        // We are ok panicing here b/c there should never be a runtime
+        // error compiling the template. Any errors are trivial bugs.
+        tt.add_template("cmd", COMMAND_TEMPLATE).unwrap();
+
+        let context = CommandContext {
+            // Only `cd` for kernel targets that share userspace with host
+            should_cd: !self.image && self.rootfs == Target::default_rootfs(),
+            host_shared: self.host_shared.clone(),
+            command: self.command.clone(),
+            command_output_port_name: COMMAND_OUTPUT_PORT_NAME.into(),
+        };
+
+        // Same as above, ignore errors cuz only trivial bugs are possible
+        tt.render("cmd", &context).unwrap()
     }
 
     /// Run this target's command inside the VM
     ///
     /// Note the command is run in a bash shell
     fn run_command(&self, qga: &QgaWrapper) -> Result<i64> {
-        let output_fn = |line: String| {
-            let _ = self.updates.send(Output::Command(line));
+        let updates = self.updates.clone();
+        let output_fn = move |line: String| {
+            let _ = updates.send(Output::Command(line));
         };
+
+        let output_stream = self
+            .connect_to_uds(&self.command_sock)
+            .context("Failed to connect to command output socket")?;
 
         let cmd = "bash";
         let script = self.command_script();
@@ -585,7 +757,14 @@ impl Qemu {
 
         // Note we are propagating environment variables for this command
         // only if it's a kernel target.
-        run_in_vm(qga, output_fn, cmd, &args, !self.image)
+        run_in_vm(
+            qga,
+            &output_fn,
+            cmd,
+            &args,
+            !self.image,
+            Some(output_stream),
+        )
     }
 
     /// Mount shared directory in the guest
@@ -596,11 +775,12 @@ impl Qemu {
         mount_tag: &str,
         ro: bool,
     ) -> Result<()> {
-        let output_fn = |line: String| {
-            let _ = self.updates.send(Output::Setup(line));
+        let updates = self.updates.clone();
+        let output_fn = move |line: String| {
+            let _ = updates.send(Output::Setup(line));
         };
 
-        let rc = run_in_vm(qga, output_fn, "mkdir", &["-p", guest_path], false)?;
+        let rc = run_in_vm(qga, &output_fn, "mkdir", &["-p", guest_path], false, None)?;
         if rc != 0 {
             bail!("Failed to mkdir {}: exit code {}", guest_path, rc);
         }
@@ -615,10 +795,11 @@ impl Qemu {
             };
             rc = run_in_vm(
                 qga,
-                output_fn,
+                &output_fn,
                 "mount",
                 &["-t", "9p", "-o", &mount_opts, mount_tag, guest_path],
                 false,
+                None,
             )?;
 
             // Exit code 32 from mount(1) indicates mount failure.
@@ -639,7 +820,7 @@ impl Qemu {
 
     /// Sync guest filesystems so any in-flight data has time to go out to host
     fn sync(&self, qga: &QgaWrapper) -> Result<()> {
-        let rc = run_in_vm(qga, |_| {}, "sync", &[], false)?;
+        let rc = run_in_vm(qga, &|_| {}, "sync", &[], false, None)?;
         if rc != 0 {
             bail!("Failed to sync guest filesystems: exit code {}", rc);
         }
@@ -763,7 +944,7 @@ impl Qemu {
         }
 
         // Connect to QMP socket
-        let qmp_stream = match self.connect_to_qmp() {
+        let qmp_stream = match self.connect_to_uds(&self.qmp_sock) {
             Ok(s) => s,
             Err(e) => {
                 let err = Self::extract_child_stderr(&mut child);
@@ -787,7 +968,7 @@ impl Qemu {
         debug!("QMP info: {:#?}", qmp_info);
 
         // Connect to QGA socket
-        let qga = QgaWrapper::new(self.qga_sock.clone(), host_supports_kvm());
+        let qga = QgaWrapper::new(self.qga_sock.clone(), host_supports_kvm(&self.arch));
         let qga = match qga {
             Ok(q) => q,
             Err(e) => {
@@ -857,5 +1038,42 @@ impl Drop for Qemu {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.qga_sock.as_path());
         let _ = fs::remove_file(self.qmp_sock.as_path());
+        let _ = fs::remove_file(self.command_sock.as_path());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guest_init_path;
+    use rstest::rstest;
+
+    use std::path::PathBuf;
+
+    #[rstest]
+    // no trailing /
+    #[case("/tmp", "/foo/tmp/bar.sh", "/tmp/bar.sh")]
+    // with trailing /
+    #[case("/tmp/", "/foo/tmp/bar.sh", "/tmp/bar.sh")]
+    // A valid case if rootfs was /foo/tmp and env::temp_dir() was /.
+    #[case("/", "/foo/tmp/bar.sh", "/bar.sh")]
+    // A valid case if env::temp_dir() was /foo/tmp and rootfs was /.
+    #[case("/foo/tmp", "/foo/tmp/bar.sh", "/foo/tmp/bar.sh")]
+    fn test_guest_init_path(
+        #[case] guest_temp_dir: &str,
+        #[case] host_init_path: &str,
+        #[case] expected: &str,
+    ) {
+        let r = guest_init_path(guest_temp_dir.into(), host_init_path.into()).unwrap();
+        assert_eq!(r, PathBuf::from(expected));
+    }
+
+    #[rstest]
+    // This should never happen given that host_init_path is made by appending guest_temp_dir to rootfs.
+    // for now it will return a guest_init_path which won't work.
+    #[case("/tmp", "/foo/bar.sh")]
+    // Invalid case because guest_temp_dir is not a suffix of dirname(host_init_path)
+    #[case("/foo/tmp", "/bar/tmp/bar.sh")]
+    fn test_invalid_guest_init_path(#[case] guest_temp_dir: &str, #[case] host_init_path: &str) {
+        guest_init_path(guest_temp_dir.into(), host_init_path.into()).unwrap_err();
     }
 }
