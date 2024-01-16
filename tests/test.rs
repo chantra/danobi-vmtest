@@ -217,6 +217,44 @@ fn test_command_runs_in_shell() {
     assert_eq!(result, "bash");
 }
 
+#[test]
+fn test_qemu_ga_niceness() {
+    let config = Config {
+        target: vec![Target {
+            name: "qemu-qa has -20 niceness".to_string(),
+            kernel: Some(asset("bzImage-v5.15-empty")),
+            // `$0` is a portable way of getting the name of the shell without relying
+            // on env vars which may be propagated from the host into the guest.
+            command: "test $(awk '{print $19}' < /proc/$(pgrep qemu-ga)/stat) -eq -20".to_string(),
+            ..Default::default()
+        }],
+    };
+    let (vmtest, _dir) = setup(config, &["main.sh"]);
+    let ui = Ui::new(vmtest);
+    let rc = ui.run(false);
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn test_qemu_ga_inner_process_niceness() {
+    let config = Config {
+        target: vec![Target {
+            name: "qemu-ga commands have 0 niceness".to_string(),
+            kernel: Some(asset("bzImage-v5.15-empty")),
+            // `$0` is a portable way of getting the name of the shell without relying
+            // on env vars which may be propagated from the host into the guest.
+            command:
+                "sleep 300 & sleep_id=$!; test $(awk '{print $19}' < /proc/${sleep_id}/stat) -eq 0"
+                    .to_string(),
+            ..Default::default()
+        }],
+    };
+    let (vmtest, _dir) = setup(config, &["main.sh"]);
+    let ui = Ui::new(vmtest);
+    let rc = ui.run(false);
+    assert_eq!(rc, 0);
+}
+
 // Tests that for kernel targets, environment variables from the host are propagated
 // into the guest.
 #[test]

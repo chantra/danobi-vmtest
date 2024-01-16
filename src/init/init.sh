@@ -102,4 +102,10 @@ if [[ -e /dev/kmsg ]]; then
 fi
 
 log "Spawning qemu-ga"
+
+# Set qemu-ga priority to -20 if possible
+if command -v renice &>/dev/null; then
+    log "Renicing current process to -20"
+    renice --priority -20 $$
+fi
 qemu-ga --method=virtio-serial --path="$vport" $qga_logs

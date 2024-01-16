@@ -753,7 +753,8 @@ impl Qemu {
 
         let cmd = "bash";
         let script = self.command_script();
-        let args = ["-c", &script];
+        let reniced_script = format!("renice --priority 0 $$; {}", script);
+        let args = ["-c", &reniced_script];
 
         // Note we are propagating environment variables for this command
         // only if it's a kernel target.
